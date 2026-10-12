@@ -1,11 +1,22 @@
 """livecode kernel to execute code in a sandbox.
+
+Hardened variant: the per-run temp dir is the only place a request can write
+(no path traversal onto the Falcon host), and the runner container has no
+network, no extra capabilities, a non-root user, a read-only rootfs and a
+process cap. A run that ignores the in-container `timeout` is killed from here.
 """
+import asyncio
 import aiodocker
 from pathlib import Path
+import os
 import tempfile
 import json
 from .msgtypes import ExecMessage
 from . import config
+
+# Hard ceiling enforced from the server side, above the in-container `timeout`.
+RUN_TIMEOUT = 15
+
 
 class Kernel:
     def __init__(self, runtime):
@@ -44,9 +55,13 @@ class Kernel:
                         msg = dict(msgtype="write", file="stdout", data=line)
                     yield msg
             finally:
-                status = await container.wait()
+                try:
+                    status = await asyncio.wait_for(container.wait(), RUN_TIMEOUT)
+                except asyncio.TimeoutError:
+                    await container.kill()
+                    status = {"StatusCode": 137}
                 yield {"msgtype": "exitstatus", "exitstatus": status['StatusCode']}
-                await container.delete()
+                await container.delete(force=True)
 
     async def read_docker_log_lines(self, container, max_line_length=1000000):
         """Reads the docker log line by line.
@@ -80,22 +95,44 @@ class Kernel:
             yield remaining
 
     def save_file(self, root, filename, contents):
-        Path(root, filename).write_text(contents)
+        # A request controls `filename` (files[].filename, code_filename, or a
+        # multipart field name). Resolve it and refuse anything that lands
+        # outside the per-run dir, so `../x` or `/etc/cron.d/x` cannot write to
+        # the Falcon host.
+        root_path = Path(root).resolve()
+        target = (root_path / filename).resolve()
+        if target.parent != root_path:
+            raise ValueError(f"invalid filename: {filename!r}")
+        target.write_text(contents)
+        target.chmod(0o644)
 
     async def start_container(self, image, command, root, env):
         docker = aiodocker.Docker()
         print('== starting a container ==')
-        # command = ["timeout", "10"] + command
+        # The runner must stay sealed off: no network (exercises read their
+        # input from the `stdin` file, not the wire), no privilege gain, a
+        # read-only rootfs, a non-root user and a process cap. /app stays
+        # writable (compiled runtimes build there), so widen the per-run dir
+        # for the non-root container user.
+        os.chmod(root, 0o777)
         env_entries = [f'{k}={v}' for k, v in env.items()]
         config = {
             'Cmd': command,
             'Image': image,
+            'User': '65534:65534',
             'Env': ["PYTHONUNBUFFERED=1", "PYTHONDONTWRITEBYTECODE=1"] + env_entries,
             'HostConfig': {
                 'Binds': [
                     root + ":/app"
                 ],
+                'NetworkMode': 'none',
+                'CapDrop': ['ALL'],
+                'SecurityOpt': ['no-new-privileges'],
+                'ReadonlyRootfs': True,
+                'Tmpfs': {'/tmp': 'rw,size=16m,noexec,nosuid'},
+                'PidsLimit': 64,
                 "Memory": 100*1024*1024,
+                "MemorySwap": 100*1024*1024,
                 "CPUQuota": 50000,
                 "CPUPeriod": 100000,
             }
